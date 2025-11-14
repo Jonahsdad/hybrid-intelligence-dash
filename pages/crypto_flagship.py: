@@ -1,21 +1,62 @@
-import streamlit as st
+# pages/crypto_flagship.py
+from __future__ import annotations
+import os, time, math, random
+from typing import Any, Dict, List
+import requests
 import pandas as pd
+import streamlit as st
 import plotly.graph_objects as go
-from lib.api import forecast  # <-- this must match the file above
+
+def _forecast(arena: str, symbol: str, horizon: int) -> Dict[str, Any]:
+    base = (os.getenv("HIS_API_BASE") or "").rstrip("/")
+    timeout = (4, 25)
+
+    if base:
+        r = requests.post(
+            f"{base}/v1/forecast",
+            json={"arena": arena, "symbol": symbol, "horizon": horizon},
+            timeout=timeout,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    # --- synthetic fallback (no backend configured) ---
+    n = 200
+    now = int(time.time())
+    step = 60 * 60  # hourly synthetic candles
+    last = 50000.0 + 2000.0 * math.sin(n / 9.0)
+    pts: List[Dict[str, Any]] = []
+    drift = random.uniform(-0.5, 0.5)
+    vol = 0.012
+    for h in range(1, horizon + 1):
+        t = now + h * step
+        yh = last * (1.0 + drift * 0.001 * h)
+        q = last * vol * math.sqrt(h)
+        pts.append({"ts": t, "yhat": yh, "q10": yh - q, "q90": yh + q})
+    return {
+        "event": {
+            "arena": arena,
+            "symbol": symbol,
+            "horizon": horizon,
+            "forecast": {"points": pts},
+            "metrics": {"entropy": 0.32, "edge": 0.07, "regime": "EXPANSION"},
+        }
+    }
 
 def show():
     st.subheader("🔥 Crypto — Flagship")
+
     with st.expander("Settings", expanded=True):
-        symbol  = st.text_input("Symbol", value="BTCUSDT")
+        symbol = st.text_input("Symbol", value="BTCUSDT")
         horizon = st.slider("Horizon", 1, 30, 5)
-        run     = st.button("Run Forecast")
+        run = st.button("Run Forecast", use_container_width=True)
 
     if not run:
         st.info("Set symbol & horizon, then click **Run Forecast**.")
         return
 
     try:
-        res = forecast("crypto", symbol, horizon)
+        res = _forecast("crypto", symbol, horizon)
     except Exception as e:
         st.error(f"Forecast call failed: {e}")
         return
@@ -27,15 +68,17 @@ def show():
         return
 
     df = pd.DataFrame(pts)
+    df["t"] = pd.to_datetime(df["ts"], unit="s")
+
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=pd.to_datetime(df["ts"], unit="s"), y=df["yhat"], mode="lines", name="yhat"))
-    fig.add_trace(go.Scatter(x=pd.to_datetime(df["ts"], unit="s"), y=df["q10"], mode="lines", name="q10", line=dict(dash="dot")))
-    fig.add_trace(go.Scatter(x=pd.to_datetime(df["ts"], unit="s"), y=df["q90"], mode="lines", name="q90", line=dict(dash="dot"), fill="tonexty"))
-    fig.update_layout(margin=dict(l=10,r=10,t=30,b=10), height=420, title=f"{symbol} • {horizon} step forecast")
+    fig.add_trace(go.Scatter(x=df["t"], y=df["yhat"], mode="lines", name="yhat"))
+    fig.add_trace(go.Scatter(x=df["t"], y=df["q10"], mode="lines", name="q10", line=dict(dash="dot")))
+    fig.add_trace(go.Scatter(x=df["t"], y=df["q90"], mode="lines", name="q90", line=dict(dash="dot"), fill="tonexty"))
+    fig.update_layout(margin=dict(l=10, r=10, t=30, b=10), height=420, title=f"{symbol} • {horizon}-step forecast")
     st.plotly_chart(fig, use_container_width=True)
 
     m = evt.get("metrics", {})
-    c1,c2,c3 = st.columns(3)
-    c1.metric("Entropy", f"{m.get('entropy', 0):.2f}")
-    c2.metric("Edge",    f"{m.get('edge', 0):.2f}")
-    c3.metric("Regime",  m.get("regime", "—"))
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Entropy", f'{m.get("entropy", 0):.2f}')
+    c2.metric("Edge", f'{m.get("edge", 0):.2f}')
+    c3.metric("Regime", m.get("regime", "—"))
