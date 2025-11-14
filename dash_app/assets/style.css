@@ -1,0 +1,5 @@
+.brand { font-weight:800; letter-spacing:.5px; }
+.muted { opacity:.8; }
+.hero { margin:6px 0 12px 0; }
+.kpi { margin:6px 0; font-weight:700; }
+.chips { display:flex; flex-wrap:wrap; gap:6px; }
