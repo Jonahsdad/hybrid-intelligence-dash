@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: hybrid-intelligence-core       # backend (FastAPI LIPE Core)
+    env: python
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: gunicorn backend.app_lipe_core:app -w 2 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000
+    envVars:
+      - key: CORS_ORIGINS
+        value: https://share.streamlit.io, https://*.streamlit.app
+      - key: BRAND
+        value: HYBRID INTELLIGENCE SYSTEMS
