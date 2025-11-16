@@ -1,89 +1,101 @@
 # pages/crypto_flagship.py
 from __future__ import annotations
-import os, time, math, random
+import os, time, math, datetime as dt
 from typing import Any, Dict, List
 import requests
 import pandas as pd
+import plotly.graph_objs as go
 import streamlit as st
-import plotly.graph_objects as go
 
+# --- config helpers ---
 def _api_base() -> str:
-    # Streamlit Cloud: prefer Secrets; fall back to env
-    return (st.secrets.get("HIS_API_BASE") or os.getenv("HIS_API_BASE") or "").rstrip("/")
+    # Prefer Streamlit Secrets → fallback to env var
+    base = (st.secrets.get("API_BASE_URL") or os.getenv("HIS_API_BASE") or "").strip()
+    return base.rstrip("/")
 
-def _forecast(arena: str, symbol: str, horizon: int) -> Dict[str, Any]:
+def _call_backend(arena: str, symbol: str, horizon: int) -> Dict[str, Any] | None:
     base = _api_base()
-    if base:
+    if not base:
+        return None
+    try:
         r = requests.post(
             f"{base}/v1/forecast",
             json={"arena": arena, "symbol": symbol, "horizon": horizon},
-            timeout=(4, 25),
+            timeout=(3, 25),
         )
+        if r.status_code in (401, 402):
+            # Paywall or auth → let UI handle it
+            st.warning("This arena requires a subscription. Use the Plans/Checkout button in the sidebar.")
+            return None
         r.raise_for_status()
         return r.json()
+    except Exception as e:
+        st.info(f"Backend not reachable, using demo data. ({e})")
+        return None
 
-    # ---------- synthetic fallback (demo mode) ----------
-    now = int(time.time()); step = 60 * 60  # hourly points
-    last = 50000.0
-    vol  = 0.012
+def _synthetic_forecast(symbol: str, horizon: int) -> Dict[str, Any]:
+    now = dt.datetime.utcnow().replace(microsecond=0)
     pts: List[Dict[str, Any]] = []
-    for h in range(1, horizon + 1):
-        t  = now + h * step
-        dr = 0.0004 * h
-        yh = last * (1 + dr) * (1 + 0.01 * math.sin(h / 2.5))
-        q  = last * vol * (h ** 0.5)
-        pts.append({"ts": t, "yhat": yh, "q10": yh - q, "q90": yh + q})
+    for i in range(horizon + 30):
+        t = now + dt.timedelta(days=i)
+        base = 100 + 5 * math.sin(i / 3.0)
+        band = 2.0 + 0.25 * i
+        pts.append({"ts": t.isoformat() + "Z", "yhat": base, "q10": base - band, "q90": base + band})
     return {
         "event": {
-            "arena": arena,
+            "arena": "crypto",
             "symbol": symbol,
             "horizon": horizon,
             "forecast": {"points": pts},
-            "metrics": {"entropy": 0.31, "edge": 0.06, "regime": "EXPANSION", "mode": "DEMO"},
+            "metrics": {"entropy": 0.33, "edge": 0.12, "regime": "Compression→Expansion"},
         }
     }
+
+def _plot_forecast(payload: Dict[str, Any]) -> go.Figure:
+    ev = payload["event"]
+    points = ev["forecast"]["points"]
+    df = pd.DataFrame(points)
+    df["ts"] = pd.to_datetime(df["ts"])
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df["ts"], y=df["q90"], mode="lines", name="q90", line=dict(width=0)))
+    fig.add_trace(go.Scatter(x=df["ts"], y=df["q10"], mode="lines", name="q10", fill="tonexty"))
+    fig.add_trace(go.Scatter(x=df["ts"], y=df["yhat"], mode="lines", name="ŷ", line=dict(dash="dash")))
+    fig.update_layout(
+        margin=dict(l=10, r=10, t=10, b=10),
+        height=460,
+        showlegend=False,
+    )
+    return fig
 
 def show():
     st.subheader("🔥 Crypto — Flagship")
 
+    # Controls
     with st.expander("Settings", expanded=True):
-        symbol  = st.text_input("Symbol", value="BTCUSDT")
-        horizon = st.slider("Horizon", 1, 30, 5)
-        run     = st.button("Run Forecast", use_container_width=True)
+        c1, c2, c3 = st.columns([2, 3, 2])
+        with c1:
+            symbol = st.text_input("Symbol", value="BTCUSDT")
+        with c2:
+            horizon = st.slider("Horizon (days)", 1, 30, value=5)
+        with c3:
+            run = st.button("Run Forecast", use_container_width=True)
 
-    if not run:
-        base = _api_base()
-        if base:
-            st.caption(f"Connected to backend: {base}")
-        else:
-            st.warning("No backend configured (HIS_API_BASE). Running in demo mode with synthetic forecast.")
-        return
+    # Run
+    if run:
+        data = _call_backend("crypto", symbol, horizon) or _synthetic_forecast(symbol, horizon)
+        ev = data["event"]
+        m = ev.get("metrics", {})
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Regime", m.get("regime", "—"))
+        c2.metric("Entropy", f"{m.get('entropy', 0):.2f}")
+        c3.metric("Edge", f"{m.get('edge', 0):.2f}")
 
-    try:
-        res = _forecast("crypto", symbol, horizon)
-    except Exception as e:
-        st.error(f"Forecast call failed: {e}")
-        return
+        st.plotly_chart(_plot_forecast(data), use_container_width=True)
 
-    evt = res.get("event", {})
-    pts = (evt.get("forecast") or {}).get("points", [])
-    if not pts:
-        st.warning("No forecast points returned.")
-        return
-
-    df = pd.DataFrame(pts); df["t"] = pd.to_datetime(df["ts"], unit="s")
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df["t"], y=df["yhat"], mode="lines", name="yhat"))
-    fig.add_trace(go.Scatter(x=df["t"], y=df["q10"],  mode="lines", name="q10",  line=dict(dash="dot")))
-    fig.add_trace(go.Scatter(x=df["t"], y=df["q90"],  mode="lines", name="q90",  line=dict(dash="dot"), fill="tonexty"))
-    fig.update_layout(margin=dict(l=10, r=10, t=30, b=10), height=420,
-                      title=f"{symbol} • {horizon}-step forecast")
-    st.plotly_chart(fig, use_container_width=True)
-
-    m = evt.get("metrics", {})
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Entropy", f'{m.get("entropy", 0):.2f}')
-    c2.metric("Edge",    f'{m.get("edge", 0):.2f}')
-    c3.metric("Regime",  m.get("regime", "—"))
-    c4.metric("Mode",    m.get("mode", "LIVE" if _api_base() else "DEMO"))
+        st.caption(
+            "If you’re seeing demo bands, set **API_BASE_URL** in Streamlit Secrets to your FastAPI "
+            "base (e.g., https://your-lipe-core.up.railway.app)."
+        )
+    else:
+        st.info("Set a symbol & horizon, then click **Run Forecast**.")
