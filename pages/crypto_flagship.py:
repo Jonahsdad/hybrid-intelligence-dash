@@ -1,3 +1,5 @@
+import os, sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 # pages/crypto_flagship.py
 from __future__ import annotations
 import os, time, math, datetime as dt
