@@ -1,103 +1,129 @@
-import os, sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 # pages/crypto_flagship.py
 from __future__ import annotations
-import os, time, math, datetime as dt
+import os, time, math
 from typing import Any, Dict, List
-import requests
+import streamlit as st
 import pandas as pd
 import plotly.graph_objs as go
-import streamlit as st
 
-# --- config helpers ---
-def _api_base() -> str:
-    # Prefer Streamlit Secrets → fallback to env var
-    base = (st.secrets.get("API_BASE_URL") or os.getenv("HIS_API_BASE") or "").strip()
-    return base.rstrip("/")
+# --------- helpers ---------
+def _api_base() -> str | None:
+    # Streamlit Cloud: use Secrets first, then env var
+    base = st.secrets.get("API_BASE_URL") if hasattr(st, "secrets") else None
+    return (base or os.getenv("API_BASE_URL") or os.getenv("HIS_API_BASE") or "").rstrip("/") or None
 
-def _call_backend(arena: str, symbol: str, horizon: int) -> Dict[str, Any] | None:
-    base = _api_base()
-    if not base:
-        return None
+def _post_forecast(base: str, arena: str, symbol: str, horizon: int) -> Dict[str, Any]:
+    import requests
+    r = requests.post(f"{base}/v1/forecast",
+                      json={"arena": arena, "symbol": symbol, "horizon": horizon},
+                      timeout=(3, 20))
+    r.raise_for_status()
+    return r.json()
+
+def _ccxt_ohlcv(symbol: str, limit: int = 500) -> pd.DataFrame | None:
     try:
-        r = requests.post(
-            f"{base}/v1/forecast",
-            json={"arena": arena, "symbol": symbol, "horizon": horizon},
-            timeout=(3, 25),
-        )
-        if r.status_code in (401, 402):
-            # Paywall or auth → let UI handle it
-            st.warning("This arena requires a subscription. Use the Plans/Checkout button in the sidebar.")
+        import ccxt
+        ex = ccxt.binance({'enableRateLimit': True})
+        mkt = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
+        data = ex.fetch_ohlcv(mkt, timeframe="1h", limit=limit)
+        if not data:
             return None
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        st.info(f"Backend not reachable, using demo data. ({e})")
+        df = pd.DataFrame(data, columns=["ts","open","high","low","close","vol"])
+        df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+        return df
+    except Exception:
         return None
 
-def _synthetic_forecast(symbol: str, horizon: int) -> Dict[str, Any]:
-    now = dt.datetime.utcnow().replace(microsecond=0)
+def _local_bands(series: pd.Series, horizon: int) -> Dict[str, Any]:
+    # simple EWMA + vol bands, LIPE-ish shape
+    closes = series.dropna().astype(float)
+    mu = closes.pct_change().ewm(span=50).mean().iloc[-1]
+    sigma = closes.pct_change().ewm(span=50).std().iloc[-1]
+    last = float(closes.iloc[-1])
+
+    pts = []
+    for h in range(1, horizon + 1):
+        drift = last * ((1 + mu) ** h)
+        q = last * (sigma * math.sqrt(h) * 1.64)  # ~q90 ≈ 1.64σ
+        pts.append({"ts": int(time.time() + h * 3600), "yhat": drift, "q10": drift - q, "q90": drift + q})
+    entropy = float(min(1.0, max(0.0, sigma * 12)))  # quick entropy proxy
+    edge = float(max(0.0, (mu - sigma/2)))           # playful "edge" proxy
+    regime = "EXPANSION" if mu > 0 and entropy < 0.5 else ("COMPRESSION" if entropy < 0.25 else "CHAOTIC")
+    return {"event": {
+        "arena": "crypto", "symbol": "LOCAL", "horizon": horizon,
+        "forecast": {"points": pts},
+        "metrics": {"entropy": entropy, "edge": edge, "regime": regime}
+    }}
+
+def _synthetic(symbol: str, horizon: int) -> Dict[str, Any]:
+    now = int(time.time()); step = 3600
+    base = 50000.0 if "BTC" in symbol.upper() else 3000.0
+    vol = 0.012
     pts: List[Dict[str, Any]] = []
-    for i in range(horizon + 30):
-        t = now + dt.timedelta(days=i)
-        base = 100 + 5 * math.sin(i / 3.0)
-        band = 2.0 + 0.25 * i
-        pts.append({"ts": t.isoformat() + "Z", "yhat": base, "q10": base - band, "q90": base + band})
-    return {
-        "event": {
-            "arena": "crypto",
-            "symbol": symbol,
-            "horizon": horizon,
-            "forecast": {"points": pts},
-            "metrics": {"entropy": 0.33, "edge": 0.12, "regime": "Compression→Expansion"},
-        }
-    }
+    for h in range(1, horizon + 1):
+        t = now + h * step
+        drift = base * (1 + 0.01 * math.sin(h/2.5))
+        q = base * vol * math.sqrt(h) * 0.65
+        pts.append({"ts": t, "yhat": drift, "q10": drift - q, "q90": drift + q})
+    return {"event": {
+        "arena":"crypto","symbol":symbol,"horizon":horizon,
+        "forecast":{"points":pts},
+        "metrics":{"entropy":0.31,"edge":0.06,"regime":"EXPANSION"}
+    }}
 
-def _plot_forecast(payload: Dict[str, Any]) -> go.Figure:
-    ev = payload["event"]
-    points = ev["forecast"]["points"]
-    df = pd.DataFrame(points)
-    df["ts"] = pd.to_datetime(df["ts"])
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df["ts"], y=df["q90"], mode="lines", name="q90", line=dict(width=0)))
-    fig.add_trace(go.Scatter(x=df["ts"], y=df["q10"], mode="lines", name="q10", fill="tonexty"))
-    fig.add_trace(go.Scatter(x=df["ts"], y=df["yhat"], mode="lines", name="ŷ", line=dict(dash="dash")))
-    fig.update_layout(
-        margin=dict(l=10, r=10, t=10, b=10),
-        height=460,
-        showlegend=False,
-    )
-    return fig
-
+# --------- UI ---------
 def show():
     st.subheader("🔥 Crypto — Flagship")
 
-    # Controls
     with st.expander("Settings", expanded=True):
-        c1, c2, c3 = st.columns([2, 3, 2])
-        with c1:
-            symbol = st.text_input("Symbol", value="BTCUSDT")
-        with c2:
-            horizon = st.slider("Horizon (days)", 1, 30, value=5)
+        c1, c2, c3 = st.columns([2,3,2])
+        with c1: symbol = st.text_input("Symbol", value="BTCUSDT")
+        with c2: horizon = st.slider("Horizon (hours)", min_value=1, max_value=48, value=8)
         with c3:
             run = st.button("Run Forecast", use_container_width=True)
 
-    # Run
-    if run:
-        data = _call_backend("crypto", symbol, horizon) or _synthetic_forecast(symbol, horizon)
-        ev = data["event"]
-        m = ev.get("metrics", {})
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Regime", m.get("regime", "—"))
-        c2.metric("Entropy", f"{m.get('entropy', 0):.2f}")
-        c3.metric("Edge", f"{m.get('edge', 0):.2f}")
+    if not run:
+        st.info("Set your symbol & horizon and click **Run Forecast**.")
+        return
 
-        st.plotly_chart(_plot_forecast(data), use_container_width=True)
+    # 1) try backend
+    base = _api_base()
+    event = None
+    if base:
+        try:
+            res = _post_forecast(base, "crypto", symbol, horizon)
+            event = res.get("event") or res
+        except Exception as e:
+            st.warning(f"Backend offline or unreachable → switching to client mode. ({e})")
 
-        st.caption(
-            "If you’re seeing demo bands, set **API_BASE_URL** in Streamlit Secrets to your FastAPI "
-            "base (e.g., https://your-lipe-core.up.railway.app)."
-        )
-    else:
-        st.info("Set a symbol & horizon, then click **Run Forecast**.")
+    # 2) try client CCXT
+    if event is None:
+        df = _ccxt_ohlcv(symbol)
+        if df is not None and not df.empty:
+            event = _local_bands(df["close"], horizon)["event"]
+
+    # 3) synthetic fallback
+    if event is None:
+        event = _synthetic(symbol, horizon)["event"]
+
+    pts = event["forecast"]["points"]
+    dfp = pd.DataFrame(pts)
+    dfp["ts"] = pd.to_datetime(dfp["ts"], unit="s", errors="coerce")
+
+    # chart
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=dfp["ts"], y=dfp["q90"], mode="lines", name="q90"))
+    fig.add_trace(go.Scatter(x=dfp["ts"], y=dfp["q10"], mode="lines", name="q10", fill="tonexty"))
+    fig.add_trace(go.Scatter(x=dfp["ts"], y=dfp["yhat"], mode="lines", name="yhat", line=dict(dash="dot")))
+    fig.update_layout(height=420, margin=dict(l=10,r=10,t=10,b=10))
+    st.plotly_chart(fig, use_container_width=True)
+
+    m = event.get("metrics", {})
+    colA, colB, colC = st.columns(3)
+    colA.metric("Regime", m.get("regime","—"))
+    colB.metric("Entropy", f"{m.get('entropy',0):.2f}")
+    colC.metric("Edge", f"{m.get('edge',0):.3f}")
+
+# allow local run
+if __name__ == "__main__":
+    show()
