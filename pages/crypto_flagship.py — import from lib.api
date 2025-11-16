@@ -1,0 +1,59 @@
+# pages/crypto_flagship.py
+from __future__ import annotations
+import os
+import streamlit as st
+from lib.api import set_api_base, ping, forecast  # alias points to api_lipe_forecast
+
+def show():
+    st.subheader("🔥 Crypto — Flagship")
+
+    # Configure backend base once
+    api_base = st.secrets.get("API_BASE_URL", os.getenv("HIS_API_BASE", "")).rstrip("/")
+    if not api_base:
+        st.warning("Set HIS_API_BASE or add API_BASE_URL to Streamlit secrets.")
+        return
+    set_api_base(api_base)
+
+    colA, colB, colC = st.columns([2,2,1])
+    with colA:
+        symbol = st.text_input("Symbol", value="BTCUSDT")
+    with colB:
+        horizon = st.slider("Horizon (days)", 1, 30, 5)
+    with colC:
+        run = st.button("Run Forecast", use_container_width=True)
+
+    ok = ping()
+    if not ok:
+        st.error("API not reachable (healthz failed). Check API_BASE_URL.")
+        return
+
+    if run:
+        try:
+            res = forecast(None, "crypto", symbol, horizon)
+            evt = res.get("event") or res
+            fc  = evt.get("forecast", {})
+            pts = fc.get("points", [])
+            entropy = (evt.get("metrics") or {}).get("entropy")
+            edge    = (evt.get("metrics") or {}).get("edge")
+
+            st.write(f"**Entropy:** {entropy} • **Edge:** {edge}")
+
+            if pts:
+                import pandas as pd, plotly.graph_objs as go
+                df = pd.DataFrame(pts)
+                fig = go.Figure()
+                fig.add_scatter(x=df["ts"], y=df["yhat"], mode="lines", name="yhat")
+                if "q10" in df and "q90" in df:
+                    fig.add_scatter(x=df["ts"], y=df["q10"], mode="lines", name="q10")
+                    fig.add_scatter(x=df["ts"], y=df["q90"], mode="lines", name="q90")
+                    fig.add_traces([go.Scatter(
+                        x=list(df["ts"])+list(df["ts"][::-1]),
+                        y=list(df["q90"])+list(df["q10"][::-1]),
+                        fill='toself', name="band", opacity=0.2, line=dict(width=0)
+                    )])
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No points returned.")
+        except Exception as e:
+            st.error("Forecast call failed.")
+            st.exception(e)
