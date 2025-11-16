@@ -1,0 +1,28 @@
+# streamlit_app.py
+from __future__ import annotations
+import streamlit as st
+from pages._registry import ARENAS
+
+st.set_page_config(page_title="HYBRID INTELLIGENCE SYSTEMS — Command", layout="wide")
+
+st.sidebar.title("HYBRID INTELLIGENCE SYSTEMS")
+st.sidebar.caption("Forecast OS • powered by LIPE")
+st.sidebar.markdown("---")
+
+st.markdown("### **HYBRID INTELLIGENCE SYSTEMS** | Global Forecast OS")
+st.metric("Engine", "Idle")
+
+labels = [a.key for a in ARENAS]
+choice = st.selectbox("Choose Your Arena", labels, index=0)
+arena = next(a for a in ARENAS if a.key == choice)
+
+import importlib
+try:
+    mod = importlib.import_module(arena.module)
+    if hasattr(mod, "show"):
+        mod.show()
+    else:
+        st.error(f"`{arena.module}` is missing a `show()` function.")
+except Exception as e:
+    st.error(f"Failed to load `{arena.module}`")
+    st.exception(e)
